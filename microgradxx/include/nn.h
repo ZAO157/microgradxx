@@ -6,6 +6,7 @@
 #include <vector>
 #include <random>
 #include <iostream>
+#include <optional>
 
 namespace micrograd {
 	using namespace engine;
@@ -44,6 +45,10 @@ namespace micrograd {
 				return Value<T>::neuron(w, x, b, nonlin);
 			}
 
+			Value<T> operator()(const std::vector<Value<T>>& x, const T* x_data) {
+				return Value<T>::neuron(w, x, b, nonlin, x_data);
+			}
+
 			void zero_grad() {
 				for (auto &v : w) v.zero_grad();
 				b.zero_grad();
@@ -79,11 +84,47 @@ namespace micrograd {
 				for (std::size_t i = 0; i < nout; i++) neurons.emplace_back(nin, nonlin);
 			}
 
+			// Runs every neuron in the layer against the same input x, in
+			// parallel. Two things about this are worth spelling out, because
+			// both were real bugs the first time this was written:
+			//
+			// 1. out is std::vector<std::optional<Value<T>>>, not
+			//    std::vector<Value<T>>. The parallel loop below writes to
+			//    out[i] by index from possibly-different threads, which needs
+			//    out to already be sized to neurons.size() before the loop
+			//    starts (writing by index is safe in parallel -- each thread
+			//    touches a different element and the vector's own size/capacity
+			//    never changes mid-loop -- but push_back()ing from multiple
+			//    threads would not be, since that mutates the vector's shared
+			//    size/capacity state). Pre-sizing a plain vector<Value<T>>
+			//    would need Value<T> to be default-constructible, and Value<T>
+			//    deliberately has no default constructor (every live Value<T>
+			//    should hold a real node, never a null one you could
+			//    accidentally read through). std::optional<Value<T>> sidesteps
+			//    that: optional is always default-constructible regardless of
+			//    whether T is, because its empty state never constructs a T at
+			//    all. Each slot goes straight from empty to holding a real
+			//    Value<T> exactly once, in the parallel loop's assignment.
+			// 2. x_data is gathered once per layer, not once per neuron -- see
+			//    the comment on NeuronValueImpl::computeData's x_data overload
+			//    in engine.h for why, and why the corresponding w-gather buffer
+			//    there has to be thread_local rather than shared.
 			std::vector<Value<T>> operator()(const std::vector<Value<T>>& x) {
-				std::vector<Value<T>> out;
-				out.reserve(neurons.size());
-				for (auto &n : neurons) out.push_back(n(x));
-				return out;
+				std::vector<T> x_data(x.size());
+			#pragma omp parallel for
+				for (std::size_t i = 0; i < x.size(); i++) x_data[i] = x[i].data();
+
+				std::vector<std::optional<Value<T>>> out(neurons.size());
+			#pragma omp parallel for
+				for (std::size_t i = 0; i < neurons.size(); i++) out[i] = neurons[i](x, x_data.data());
+
+				// unwrap back into a plain vector<Value<T>>, single-threaded (no
+				// race: the parallel region above already joined, via the
+				// implicit barrier at the end of each #pragma omp parallel for)
+				std::vector<Value<T>> result;
+				result.reserve(out.size());
+				for (auto& o : out) result.push_back(std::move(*o));
+				return result;
 			}
 
 			void zero_grad() {
