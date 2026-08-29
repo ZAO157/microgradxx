@@ -24,8 +24,38 @@
 // moved-from Value<T> (impl == nullptr) -- the same convention the
 // standard library uses for moved-from objects: such a Value may only be
 // destroyed or assigned to afterward, never read via data()/grad()/etc.
+// There is deliberately no default constructor: a Value<T> you can hold
+// is always either freshly built from a T/ValueImpl<T>*, or a copy/move of
+// one that was. (A container that needs to default-construct a slot before
+// it has a real Value<T> to put there -- e.g. writing into a pre-sized
+// vector from multiple threads -- should hold std::optional<Value<T>>
+// instead; see Layer::operator() in nn.h.)
+//
+// ---------------------------------------------------------------------
+// Thread-safety note:
+//
+// `refcnt` is a std::atomic<unsigned int>, not a plain unsigned int. This
+// engine allows two or more Value<T>/ValueImpl<T> node graphs to share a
+// child (the common case being several Neuron<T>s in one Layer all taking
+// the same input vector x): building those nodes concurrently -- as
+// nn.h's parallel Layer::operator() does -- means multiple threads
+// increment the *same* child's refcnt at the same time. A plain
+// unsigned int refcnt++ is a read-modify-write with no atomicity
+// guarantee at all; two threads can both read the same pre-increment
+// value and both write back count+1, silently losing one increment. That
+// under-count can (and, empirically, does) let a node's refcnt reach zero
+// while something still points to it, triggering a premature delete and
+// a use-after-free the next time that "something" is touched. Every
+// refcnt read-modify-write in this file (++, --, and the compound
+// decrement-and-test used before every delete) goes through
+// std::atomic's own ++/--/compound operators, which are individually
+// atomic, so this race is closed without changing any of the calling
+// code's syntax. See the class-level encapsulation note below for why
+// this member (and the rest of a node's internals) isn't reachable from
+// outside Value<T> in the first place.
 // ---------------------------------------------------------------------
 
+#include <atomic>
 #include <iostream>
 #include <cstdlib>
 #include <cmath>
@@ -230,6 +260,19 @@ namespace micrograd {
 				return Value<T>(new NeuronValueImpl<T>(wptrs, xptrs, b.impl, nonlin));
 			}
 
+			// same as above, but the caller has already gathered x's data() values
+			// into one contiguous buffer (x_data) -- see NeuronValueImpl::computeData
+			// below for why that's worth doing when many neurons share the same x,
+			// as nn.h's parallel Layer::operator() does.
+			static Value<T> neuron(const std::vector<Value<T>>& w, const std::vector<Value<T>>& x, const Value<T>& b, bool nonlin, const T* x_data) {
+				std::vector<ValueImpl<T>*> wptrs, xptrs;
+				wptrs.reserve(w.size());
+				for (auto& wi : w) wptrs.push_back(wi.impl);
+				xptrs.reserve(x.size());
+				for (auto& xi : x) xptrs.push_back(xi.impl);
+				return Value<T>(new NeuronValueImpl<T>(wptrs, xptrs, b.impl, nonlin, x_data));
+			}
+
 			friend std::ostream& operator<<(std::ostream& os, const Value<T>& v) {
 				return os << "Value(data=" << v.data() << ", grad=" << v.grad() << ")";
 			}
@@ -238,18 +281,58 @@ namespace micrograd {
 		// Base class for every computation-graph node. Holds the forward value
 		// (`data`), the accumulated gradient (`grad`, populated by backward()),
 		// `height` (used to topologically order the backward pass -- see
-		// Value<T>::backward() above), and `queued` (this node's dedup flag for
-		// the current backward() pass). `refcnt` is owned/managed externally --
-		// by whichever Value<T> handles and/or parent nodes reference this node,
-		// never by the node itself.
+		// Value<T>::backward() above), `queued` (this node's dedup flag for the
+		// current backward() pass), and `refcnt` (see the thread-safety note at
+		// the top of the file).
+		//
+		// Encapsulation: everything here is `protected`, and Value<T> is the
+		// only class ever granted `friend` access to it. A node's internals
+		// (its refcnt in particular) are only ever safe to touch through the
+		// bookkeeping Value<T> already does in its constructors/destructor/
+		// assignment operators -- poking `data`/`grad`/`refcnt` directly from
+		// outside that bookkeeping is exactly how you'd corrupt the graph or
+		// leak/double-free a node. The concrete op subclasses' *constructors*
+		// stay public further down, since Value<T>'s own operator+/operator*/
+		// etc. (friend *functions*, not friend of every ValueImpl subclass)
+		// need to `new` them directly -- but by the time you can call one of
+		// those constructors you can only have gotten its ValueImpl<T>*
+		// arguments from an existing Value<T>::impl in the first place, so
+		// nothing outside this file can ever produce a "bare" node that isn't
+		// already owned by some Value<T>.
 		//
 		// A plain ValueImpl<T> (as opposed to one of its subclasses) is a leaf:
 		// no children, so grad_propagate() is a no-op -- gradients simply accumulate
 		// on it and go nowhere further.
 		template <class T>
 		class ValueImpl {
-		public:
-			unsigned int refcnt = 0;
+			// The complete, closed list of code allowed to touch a node's
+			// internals: the public handle (Value<T>) and every node type in
+			// this file. The node types all need this -- not just to access
+			// *their own* inherited data/grad/height, which ordinary protected
+			// inheritance already allows, but to reach into a *sibling* node's
+			// data/grad/height/refcnt through a plain ValueImpl<T>* (e.g.
+			// AddValueImpl's constructor reading L->data/R->data, or any
+			// grad_propagate() writing childL->grad) -- C++ does not treat
+			// "protected, inherited from the same base" as accessible through
+			// an arbitrary same-base pointer to a *different* subclass, only
+			// through a pointer of your own (or friended) type, so plain
+			// `protected` alone isn't enough to let AddValueImpl read a field
+			// on whatever concrete node type L actually points to. Nothing
+			// outside this file appears on this list.
+			friend class Value<T>;
+			friend class BinaryValueImpl<T>;
+			friend class UnaryValueImpl<T>;
+			friend class AddValueImpl<T>;
+			friend class MulValueImpl<T>;
+			friend class PowValueImpl<T>;
+			friend class ReLUValueImpl<T>;
+			friend class NegValueImpl<T>;
+			friend class SubValueImpl<T>;
+			friend class DivValueImpl<T>;
+			friend class NeuronValueImpl<T>;
+
+		protected:
+			std::atomic<unsigned int> refcnt{0};
 			T data;
 			T grad;
 			const unsigned int height;
@@ -269,11 +352,6 @@ namespace micrograd {
 				grad(V->grad),
 				height(V->height) {}
 
-			// virtual so that `delete` through a base ValueImpl<T>* (as happens
-			// throughout this file, e.g. in ~BinaryValueImpl) correctly runs the
-			// most-derived destructor.
-			virtual ~ValueImpl() {}
-
 			// returns a new heap-allocated node that is a shallow copy of this
 			// one (same children, refcounted accordingly). Every subclass
 			// overrides this to `new` its own concrete type -- there's no way to
@@ -289,6 +367,13 @@ namespace micrograd {
 			// `bucket` so Value<T>::backward()'s main loop will visit it. A leaf
 			// node has nothing to propagate to, hence the empty default body.
 			virtual void grad_propagate(std::vector<std::vector<ValueImpl<T>*>>&) {}
+
+		public:
+			// virtual so that `delete` through a base ValueImpl<T>* (as happens
+			// throughout this file, e.g. in ~BinaryValueImpl) correctly runs the
+			// most-derived destructor. Public: deleting a node is a normal part
+			// of every subclass's own destructor tearing down its children.
+			virtual ~ValueImpl() {}
 		};
 
 		// Shared base for every two-child (binary) operation: owns childL/childR,
@@ -299,7 +384,7 @@ namespace micrograd {
 		// only a concrete op knows its own forward formula and derivative.
 		template <class T>
 		class BinaryValueImpl : public ValueImpl<T> {
-		public:
+		protected:
 			ValueImpl<T>* childL;
 			ValueImpl<T>* childR;
 
@@ -319,11 +404,6 @@ namespace micrograd {
 				(childR->refcnt)++;
 			}
 
-			~BinaryValueImpl() {
-				if (--(childL->refcnt) == 0) delete childL;
-				if (--(childR->refcnt) == 0) delete childR;
-			}
-
 			virtual ValueImpl<T>* copy() override = 0;
 
 			virtual void grad_propagate(std::vector<std::vector<ValueImpl<T>*>>& bucket) override = 0;
@@ -337,12 +417,18 @@ namespace micrograd {
 					childR->queued = true; bucket[childR->height].push_back(childR);
 				}
 			}
+
+		public:
+			~BinaryValueImpl() {
+				if (--(childL->refcnt) == 0) delete childL;
+				if (--(childR->refcnt) == 0) delete childR;
+			}
 		};
 
 		// Same idea as BinaryValueImpl, but for single-child (unary) operations.
 		template <class T>
 		class UnaryValueImpl : public ValueImpl<T> {
-		public:
+		protected:
 			ValueImpl<T>* childL;
 
 			UnaryValueImpl(T data_, ValueImpl<T>* L) :
@@ -357,10 +443,6 @@ namespace micrograd {
 				(childL->refcnt)++;
 			}
 
-			~UnaryValueImpl() {
-				if (--(childL->refcnt) == 0) delete childL;
-			}
-
 			virtual ValueImpl<T>* copy() override = 0;
 
 			virtual void grad_propagate(std::vector<std::vector<ValueImpl<T>*>>& bucket) override = 0;
@@ -371,18 +453,27 @@ namespace micrograd {
 					childL->queued = true; bucket[childL->height].push_back(childL);
 				}
 			}
+
+		public:
+			~UnaryValueImpl() {
+				if (--(childL->refcnt) == 0) delete childL;
+			}
 		};
 
 		// z = L + R.  dz/dL = 1, dz/dR = 1.
 		template <class T>
 		class AddValueImpl : public BinaryValueImpl<T> {
 		public:
+			// public: this is the sanctioned way to build one of these nodes, and
+			// it's what Value<T>::operator+ (a friend *function* of Value<T>, not
+			// of AddValueImpl) calls directly.
 			AddValueImpl(ValueImpl<T>* L, ValueImpl<T>* R) :
 				BinaryValueImpl<T>(L->data + R->data, L, R) {}
 
 			AddValueImpl(AddValueImpl<T>* V) :
 				BinaryValueImpl<T>(V) {}
 
+		protected:
 			virtual ValueImpl<T>* copy() override {
 				return new AddValueImpl<T>(this);
 			}
@@ -404,6 +495,7 @@ namespace micrograd {
 			MulValueImpl(MulValueImpl<T>* V) :
 				BinaryValueImpl<T>(V) {}
 
+		protected:
 			virtual ValueImpl<T>* copy() override {
 				return new MulValueImpl<T>(this);
 			}
@@ -426,6 +518,7 @@ namespace micrograd {
 			PowValueImpl(PowValueImpl<T>* V) :
 				BinaryValueImpl<T>(V) {}
 
+		protected:
 			virtual ValueImpl<T>* copy() override {
 				return new PowValueImpl<T>(this);
 			}
@@ -452,6 +545,7 @@ namespace micrograd {
 			ReLUValueImpl(ReLUValueImpl<T>* V) :
 				UnaryValueImpl<T>(V) {}
 
+		protected:
 			virtual ValueImpl<T>* copy() override {
 				return new ReLUValueImpl<T>(this);
 			}
@@ -472,6 +566,7 @@ namespace micrograd {
 			NegValueImpl(NegValueImpl<T>* V) :
 				UnaryValueImpl<T>(V) {}
 
+		protected:
 			virtual ValueImpl<T>* copy() override {
 				return new NegValueImpl<T>(this);
 			}
@@ -492,6 +587,7 @@ namespace micrograd {
 			SubValueImpl(SubValueImpl<T>* V) :
 				BinaryValueImpl<T>(V) {}
 
+		protected:
 			virtual ValueImpl<T>* copy() override {
 				return new SubValueImpl<T>(this);
 			}
@@ -513,6 +609,7 @@ namespace micrograd {
 			DivValueImpl(DivValueImpl<T>* V) :
 				BinaryValueImpl<T>(V) {}
 
+		protected:
 			virtual ValueImpl<T>* copy() override {
 				return new DivValueImpl<T>(this);
 			}
@@ -534,7 +631,7 @@ namespace micrograd {
 		// two, so its refcounting and grad_propagate() are handled directly here.
 		template <class T>
 		class NeuronValueImpl : public ValueImpl<T> {
-		public:
+		protected:
 			std::vector<ValueImpl<T>*> w;
 			std::vector<ValueImpl<T>*> x;
 			ValueImpl<T>* b;
@@ -546,14 +643,66 @@ namespace micrograd {
 				return nonlin ? (sum > 0 ? sum : 0) : sum;
 			}
 
+			// Same forward formula as above, but takes x's data() values already
+			// gathered into one contiguous buffer (x_data) by the caller, instead
+			// of reading x[i]->data through nin separate pointer dereferences.
+			// This matters when many neurons share the same x (a whole Layer's
+			// worth, as nn.h's parallel Layer::operator() does): gathering once
+			// per *layer* instead of once per *neuron* turns nin*nout scattered
+			// reads into nin scattered reads (the gather nn.h already did) plus
+			// nin*nout contiguous ones (this dot product).
+			//
+			// w[i]->data is still read through a pointer per element -- each
+			// neuron's own weights are unique to that neuron, so there's nothing
+			// to hoist there the way there was for the shared x -- but gathering
+			// them into a contiguous buffer first still helps, because it turns
+			// one pointer-chasing loop plus one arithmetic loop into one
+			// pointer-chasing loop (line below, inherently scalar -- there's no
+			// way to vectorize a gather through scattered heap addresses without
+			// changing the node's storage layout) followed by one loop over two
+			// contiguous, aligned buffers that a compiler can actually
+			// auto-vectorize. The buffer itself must be thread_local: this
+			// function runs concurrently, once per neuron, from nn.h's
+			// `#pragma omp parallel for`, so a plain function-local `static`
+			// buffer shared across threads would just be a second data race of
+			// exactly the same shape as the refcnt one described at the top of
+			// this file. thread_local gives each worker thread its own buffer,
+			// reused (not reallocated) across every neuron it processes, in this
+			// call and in every later one -- so the allocation cost is paid once
+			// per thread, not once per neuron per forward pass.
+			static T computeData(const std::vector<ValueImpl<T>*>& w, const std::vector<ValueImpl<T>*>&, ValueImpl<T>* b, bool nonlin, const T* x_data) {
+				thread_local std::vector<T> wbuf;
+				wbuf.resize(w.size());
+				for (std::size_t i = 0; i < w.size(); i++) wbuf[i] = w[i]->data;
+				T sum = b->data;
+				// reduction(+:sum) tells the compiler it may reorder/vectorize
+				// this accumulation (floating-point addition isn't associative,
+				// so without permission to reorder it, auto-vectorization of a
+				// running sum is off the table) -- needs -fopenmp or
+				// -fopenmp-simd to take effect; it's a harmless no-op pragma
+				// otherwise.
+			#pragma omp simd reduction(+:sum)
+				for (std::size_t i = 0; i < w.size(); i++) sum += wbuf[i] * x_data[i];
+				return nonlin ? (sum > 0 ? sum : 0) : sum;
+			}
+
 			static unsigned int computeHeight(const std::vector<ValueImpl<T>*>& w, const std::vector<ValueImpl<T>*>& x, ValueImpl<T>* b) {
 				unsigned int h = b->height;
 				for (std::size_t i = 0; i < w.size(); i++) h = std::max(h, std::max(w[i]->height, x[i]->height));
 				return h + 1;
 			}
 
+		public:
 			NeuronValueImpl(const std::vector<ValueImpl<T>*>& w_, const std::vector<ValueImpl<T>*>& x_, ValueImpl<T>* b_, bool nonlin_) :
 				ValueImpl<T>(computeData(w_, x_, b_, nonlin_), computeHeight(w_, x_, b_)),
+				w(w_), x(x_), b(b_), nonlin(nonlin_) {
+				for (auto* wi : w) wi->refcnt++;
+				for (auto* xi : x) xi->refcnt++;
+				b->refcnt++;
+			}
+
+			NeuronValueImpl(const std::vector<ValueImpl<T>*>& w_, const std::vector<ValueImpl<T>*>& x_, ValueImpl<T>* b_, bool nonlin_, const T* x_data) :
+				ValueImpl<T>(computeData(w_, x_, b_, nonlin_, x_data), computeHeight(w_, x_, b_)),
 				w(w_), x(x_), b(b_), nonlin(nonlin_) {
 				for (auto* wi : w) wi->refcnt++;
 				for (auto* xi : x) xi->refcnt++;
@@ -574,6 +723,7 @@ namespace micrograd {
 				if (--(b->refcnt) == 0) delete b;
 			}
 
+		protected:
 			virtual ValueImpl<T>* copy() override {
 				return new NeuronValueImpl<T>(this);
 			}
